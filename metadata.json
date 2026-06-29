@@ -1,0 +1,6 @@
+{
+  "name": "GoPixel CMS",
+  "description": "A WordPress-like HTML CMS system with a visual front-end drag-and-drop article builder, dynamic sitemaps, JSON-LD structured schema support, robust RBAC authentication, custom SMTP email forms, and advanced visual analytics.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
