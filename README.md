@@ -52,7 +52,7 @@ This provides:
 ---
 
 # Demo
-For Demo: [https://demo.cms.gopixel.in](https://demo.cms.gopixel.in)
+For Demo: [https://demo-cms.gopixel.in/](https://demo-cms.gopixel.in/)
 
 ---
 
