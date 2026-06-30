@@ -87,13 +87,126 @@ interface DatabaseSchema {
   comments?: Comment[];
 }
 
+function escapeHTML(text: string): string {
+  if (!text) return '';
+  return text
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;');
+}
+
+const NEW_PBKDF2_ITERATIONS = 100000;
+const OLD_PBKDF2_ITERATIONS = 1000;
+
 function generateSalt(): string {
   return crypto.randomBytes(16).toString('hex');
 }
 
-function hashPassword(password: string, salt: string): string {
-  return crypto.pbkdf2Sync(password, salt, 1000, 64, 'sha512').toString('hex');
+function hashPassword(password: string, salt: string, iterations = NEW_PBKDF2_ITERATIONS): string {
+  return crypto.pbkdf2Sync(password, salt, iterations, 64, 'sha512').toString('hex');
 }
+
+// Secure Session Secret Management & HMAC signatures
+let sessionSecret: string | null = null;
+
+function getSessionSecret(): string {
+  if (sessionSecret) return sessionSecret;
+  
+  try {
+    const db = readDB();
+    if (db.siteSettings && (db.siteSettings as any).sessionSecret) {
+      sessionSecret = (db.siteSettings as any).sessionSecret;
+      return sessionSecret!;
+    }
+    
+    // Generate new secure secret
+    const newSecret = crypto.randomBytes(32).toString('hex');
+    sessionSecret = newSecret;
+    
+    // Persist secret in db
+    if (db.siteSettings) {
+      (db.siteSettings as any).sessionSecret = newSecret;
+      writeDB(db);
+    }
+    return newSecret;
+  } catch (e) {
+    sessionSecret = crypto.randomBytes(32).toString('hex');
+    return sessionSecret;
+  }
+}
+
+function generateSessionToken(role: string, username: string): string {
+  const payload = `session-${role}-${username}-${Date.now()}`;
+  const signature = crypto.createHmac('sha256', getSessionSecret()).update(payload).digest('hex');
+  return `${payload}.${signature}`;
+}
+
+function verifySessionToken(token: string): { role: UserRole; username: string } | null {
+  try {
+    const lastDot = token.lastIndexOf('.');
+    if (lastDot === -1) return null;
+    const payload = token.substring(0, lastDot);
+    const signature = token.substring(lastDot + 1);
+    
+    const expectedSignature = crypto.createHmac('sha256', getSessionSecret()).update(payload).digest('hex');
+    
+    const sigBuf = Buffer.from(signature, 'hex');
+    const expBuf = Buffer.from(expectedSignature, 'hex');
+    if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+      return null;
+    }
+    
+    const parts = payload.split('-');
+    if (parts.length < 4 || parts[0] !== 'session') {
+      return null;
+    }
+    
+    const role = parts[1] as UserRole;
+    const username = parts[2];
+    const timestamp = parseInt(parts[3], 10);
+    
+    // Expire session after 30 days
+    if (Date.now() - timestamp > 30 * 24 * 60 * 60 * 1000) {
+      return null;
+    }
+    
+    return { role, username };
+  } catch (e) {
+    return null;
+  }
+}
+
+// IP-based Rate Limiting tracking
+const rateLimits = new Map<string, { count: number; resetTime: number }>();
+
+function createRateLimiter(windowMs: number, maxRequests: number, message: string) {
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    const ip = (req.headers['x-forwarded-for'] as string || req.ip || 'unknown').split(',')[0].trim();
+    const key = `${req.path}:${ip}`;
+    const now = Date.now();
+    
+    const limit = rateLimits.get(key);
+    if (!limit || limit.resetTime < now) {
+      rateLimits.set(key, { count: 1, resetTime: now + windowMs });
+      return next();
+    }
+    
+    if (limit.count >= maxRequests) {
+      logToDB('security', `Rate limit exceeded by IP: ${ip} on route ${req.path}`, 'rate_limit');
+      return res.status(429).json({ error: message });
+    }
+    
+    limit.count += 1;
+    next();
+  };
+}
+
+const loginRateLimiter = createRateLimiter(5 * 60 * 1000, 10, 'Too many login attempts from this IP. Please try again in 5 minutes.');
+const registerRateLimiter = createRateLimiter(10 * 60 * 1000, 5, 'Too many registration attempts from this IP. Please try again in 10 minutes.');
+const formSubmissionRateLimiter = createRateLimiter(2 * 60 * 1000, 10, 'Too many form submissions. Please wait a moment before trying again.');
+const commentPostRateLimiter = createRateLimiter(5 * 60 * 1000, 10, 'Too many comments submitted from this IP. Please wait before posting again.');
 
 function getInitialDB(): DatabaseSchema {
   return {
@@ -416,6 +529,15 @@ readDB();
 app.use(compression());
 app.use(express.json());
 
+// Inject Security Response Headers
+app.use((req, res, next) => {
+  res.setHeader('X-Frame-Options', 'SAMEORIGIN');
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('X-XSS-Protection', '1; mode=block');
+  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
+  next();
+});
+
 // Redirects management global middleware interceptor
 app.use((req, res, next) => {
   // Ignore static assets and API calls to prevent performance penalties
@@ -507,14 +629,12 @@ function requireAuth(allowedRoles?: UserRole[]) {
     }
     
     const token = authHeader.substring(7); // "Bearer <token>"
-    // Our token format is: "user-role-username" for secure simulation
-    const parts = token.split('-');
-    if (parts.length < 3 || parts[0] !== 'session') {
-      return res.status(401).json({ error: 'Invalid authentication session' });
+    const verified = verifySessionToken(token);
+    if (!verified) {
+      return res.status(401).json({ error: 'Invalid or expired authentication session' });
     }
     
-    const role = parts[1] as UserRole;
-    const username = parts[2];
+    const { role, username } = verified;
     
     const db = readDB();
     const activeUser = db.users.find(u => u.username === username && u.role === role);
@@ -543,7 +663,7 @@ function requireAuth(allowedRoles?: UserRole[]) {
 const loginAttempts = new Map<string, { count: number; lockUntil: number }>();
 
 // Login Handler
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', loginRateLimiter, (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) {
     return res.status(400).json({ error: 'Username and password are required' });
@@ -570,11 +690,18 @@ app.post('/api/auth/login', (req, res) => {
   }
   
   let isValid = false;
+  let shouldUpgradeHash = false;
   if (matchedUser.salt && matchedUser.passwordHash) {
-    isValid = hashPassword(password, matchedUser.salt) === matchedUser.passwordHash;
+    if (hashPassword(password, matchedUser.salt, NEW_PBKDF2_ITERATIONS) === matchedUser.passwordHash) {
+      isValid = true;
+    } else if (hashPassword(password, matchedUser.salt, OLD_PBKDF2_ITERATIONS) === matchedUser.passwordHash) {
+      isValid = true;
+      shouldUpgradeHash = true;
+    }
   } else {
     // Backwards compatibility fallback if salt/hash is somehow missing
     isValid = password === `${username}123` || password === username;
+    shouldUpgradeHash = true;
   }
 
   if (!isValid) {
@@ -592,8 +719,21 @@ app.post('/api/auth/login', (req, res) => {
   // Clear attempts on success
   loginAttempts.delete(username);
 
-  // Return user details + mock session token
-  const token = `session-${matchedUser.role}-${matchedUser.username}-${Date.now()}`;
+  // Upgrade password hashing parameters automatically on successful login if using older iterations
+  if (shouldUpgradeHash) {
+    const salt = generateSalt();
+    const newHash = hashPassword(password, salt, NEW_PBKDF2_ITERATIONS);
+    const userIndex = db.users.findIndex(u => u.username === username);
+    if (userIndex !== -1) {
+      db.users[userIndex].salt = salt;
+      db.users[userIndex].passwordHash = newHash;
+      writeDB(db);
+      logToDB('security', `Upgraded password hash iteration strength to 100k for user ${username}`, 'crypto_upgrade');
+    }
+  }
+
+  // Generate secure signed session token
+  const token = generateSessionToken(matchedUser.role, matchedUser.username);
   logToDB('info', `User logged in: ${matchedUser.username} (${matchedUser.role})`, 'auth_success');
   
   res.json({
@@ -603,7 +743,7 @@ app.post('/api/auth/login', (req, res) => {
 });
 
 // Public self-registration (Sign up)
-app.post('/api/auth/register', async (req, res) => {
+app.post('/api/auth/register', registerRateLimiter, async (req, res) => {
   const db = readDB();
   
   if (db.siteSettings.allowPublicSignup === false) {
@@ -894,7 +1034,7 @@ app.delete('/api/submissions', requireAuth(['admin']), (req, res) => {
 });
 
 // SUBMIT form data (PUBLIC ENDPOINT)
-app.post('/api/forms/submit/:formId', async (req, res) => {
+app.post('/api/forms/submit/:formId', formSubmissionRateLimiter, async (req, res) => {
   const { data } = req.body;
   if (!data) {
     return res.status(400).json({ error: 'Submission data is missing' });
@@ -1823,8 +1963,8 @@ app.post('/api/setup/install', async (req, res) => {
 
   writeDB(db);
 
-  // Generate session token
-  const token = `session-admin-${superadminUser.username}-${Date.now()}`;
+  // Generate secure signed session token
+  const token = generateSessionToken(superadminUser.role, superadminUser.username);
   logToDB('info', `Superadmin logged in immediately after installation setup: ${superadminUser.username}`, 'auth_success');
 
   res.status(201).json({
@@ -2192,8 +2332,8 @@ app.get('/api/posts/:postId/comments', (req, res) => {
   let isStaff = false;
   if (authHeader && authHeader.startsWith('Bearer ')) {
     const token = authHeader.substring(7);
-    const parts = token.split('-');
-    if (parts.length >= 3 && parts[0] === 'session' && ['admin', 'editor'].includes(parts[1])) {
+    const verified = verifySessionToken(token);
+    if (verified && ['admin', 'editor'].includes(verified.role)) {
       isStaff = true;
     }
   }
@@ -2206,7 +2346,7 @@ app.get('/api/posts/:postId/comments', (req, res) => {
 });
 
 // POST new comment for review
-app.post('/api/posts/:postId/comments', async (req, res) => {
+app.post('/api/posts/:postId/comments', commentPostRateLimiter, async (req, res) => {
   const { postId } = req.params;
   const { authorName, authorEmail, content } = req.body;
   if (!authorName || !authorEmail || !content) {
@@ -2226,9 +2366,9 @@ app.post('/api/posts/:postId/comments', async (req, res) => {
   const newComment: Comment = {
     id: `comment-${Date.now()}-${Math.random().toString(36).substr(2, 5)}`,
     postId,
-    authorName: authorName.trim(),
-    authorEmail: authorEmail.trim(),
-    content: content.trim(),
+    authorName: escapeHTML(authorName.trim()),
+    authorEmail: escapeHTML(authorEmail.trim()),
+    content: escapeHTML(content.trim()),
     createdAt: new Date().toISOString(),
     approved: false // Moderated by default
   };
@@ -2965,6 +3105,47 @@ app.get('/p/:slug', (req, res) => {
     `);
   }
   
+  const websiteType = db.siteSettings?.websiteType || 'blog';
+  const isDark = websiteType === 'portfolio';
+
+  const h1Class = isDark ? 'text-4xl font-extrabold text-white tracking-tight' : 'text-4xl font-extrabold text-slate-900 tracking-tight';
+  const h2Class = isDark ? 'text-3xl font-bold text-slate-100 tracking-tight' : 'text-3xl font-bold text-slate-800 tracking-tight';
+  const h3Class = isDark ? 'text-2xl font-semibold text-slate-200' : 'text-2xl font-semibold text-slate-800';
+  const h4Class = isDark ? 'text-xl font-semibold text-slate-200' : 'text-xl font-semibold text-slate-800';
+  const pClass = isDark ? 'text-slate-200 leading-relaxed text-base md:text-lg font-medium' : 'text-slate-700 leading-relaxed text-base md:text-lg';
+  const captionTitleClass = isDark ? 'text-sm font-bold text-slate-200' : 'text-sm font-bold text-slate-800';
+  const captionAltClass = isDark ? 'text-xs text-slate-500 italic' : 'text-xs text-slate-400 italic';
+  const captionDescClass = isDark ? 'text-xs text-slate-400 mt-1' : 'text-xs text-slate-500 mt-1';
+  
+  const quoteClass = isDark 
+    ? 'border-l-4 border-teal-500 bg-slate-900/60 p-6 rounded-r-2xl my-6 italic text-lg text-slate-200' 
+    : 'border-l-4 border-teal-500 bg-slate-50 p-6 rounded-r-2xl my-6 italic text-lg text-slate-700';
+
+  const dividerClass = isDark ? 'border-t border-slate-800 my-8' : 'border-t border-slate-200 my-8';
+  
+  const formWrapperClass = isDark 
+    ? 'bg-slate-900 border border-slate-800/80 p-6 md:p-8 rounded-2xl my-8 max-w-xl mx-auto shadow-sm' 
+    : 'bg-slate-50 border border-slate-100 p-6 md:p-8 rounded-2xl my-8 max-w-xl mx-auto shadow-sm';
+    
+  const formTitleClass = isDark ? 'text-lg font-bold text-white mb-4' : 'text-lg font-bold text-slate-800 mb-4';
+  const formLabelClass = isDark ? 'block text-sm font-medium text-slate-300 mb-1' : 'block text-sm font-medium text-slate-700 mb-1';
+  const formInputClass = isDark 
+    ? 'w-full px-4 py-2 bg-slate-950 border border-slate-800 rounded-xl text-slate-200 placeholder-slate-600 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:border-transparent text-sm transition' 
+    : 'w-full px-4 py-2 bg-white border border-slate-200 rounded-xl text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:border-transparent text-sm transition';
+
+  const pdfBlockClass = isDark
+    ? 'max-w-xl mx-auto bg-slate-900 hover:bg-slate-800/80 border border-slate-800/80 rounded-2xl p-5 my-6 flex items-center justify-between transition group shadow-sm'
+    : 'max-w-xl mx-auto bg-slate-50 hover:bg-slate-100/80 border border-slate-200/60 rounded-2xl p-5 my-6 flex items-center justify-between transition group shadow-sm';
+  const pdfTitleClass = isDark ? 'text-sm font-bold text-slate-200' : 'text-sm font-bold text-slate-800';
+  const pdfDescClass = isDark ? 'text-xs text-slate-500 mt-0.5' : 'text-xs text-slate-400 mt-0.5';
+
+  const embedBgClass = isDark ? 'bg-slate-900 border border-slate-800/80' : 'bg-slate-50 border border-slate-100';
+  const emptyBlockClass = isDark ? 'bg-slate-900/60 text-slate-500 text-xs p-4 rounded-xl text-center italic my-4 border border-slate-800/50' : 'bg-slate-100 text-slate-500 text-xs p-4 rounded-xl text-center italic my-4';
+
+  const tagClass = isDark
+    ? 'bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-200 hover:border-slate-700 px-2.5 py-1 rounded-full text-xs font-bold transition'
+    : 'bg-slate-100 text-slate-600 hover:bg-slate-200 px-2.5 py-1 rounded-full text-xs font-bold transition';
+
   // Render visual blocks into server-side semantic HTML
   let contentHtml = '';
   
@@ -2986,20 +3167,20 @@ app.get('/p/:slug', (req, res) => {
           const lvl = block.settings.level || 2;
           const text = block.settings.text || '';
           if (lvl === 1) {
-            contentHtml += `<h1 class="text-4xl font-extrabold text-slate-900 tracking-tight ${alignClass} mb-4" style="${color}">${text}</h1>`;
+            contentHtml += `<h1 class="${h1Class} ${alignClass} mb-4" style="${color}">${text}</h1>`;
           } else if (lvl === 2) {
-            contentHtml += `<h2 class="text-3xl font-bold text-slate-800 tracking-tight ${alignClass} mt-8 mb-4" style="${color}">${text}</h2>`;
+            contentHtml += `<h2 class="${h2Class} ${alignClass} mt-8 mb-4" style="${color}">${text}</h2>`;
           } else if (lvl === 3) {
-            contentHtml += `<h3 class="text-2xl font-semibold text-slate-800 ${alignClass} mt-6 mb-3" style="${color}">${text}</h3>`;
+            contentHtml += `<h3 class="${h3Class} ${alignClass} mt-6 mb-3" style="${color}">${text}</h3>`;
           } else {
-            contentHtml += `<h4 class="text-xl font-semibold text-slate-800 ${alignClass} mt-4 mb-2" style="${color}">${text}</h4>`;
+            contentHtml += `<h4 class="${h4Class} ${alignClass} mt-4 mb-2" style="${color}">${text}</h4>`;
           }
           break;
         }
         case 'paragraph': {
           const text = block.settings.text || '';
           // Render as a div instead of p so nested headings/paragraphs from external copy-paste are semantically valid and styled beautifully.
-          contentHtml += `<div class="text-slate-600 leading-relaxed text-base ${alignClass} mb-4" style="${color}">${text}</div>`;
+          contentHtml += `<div class="${pClass} ${alignClass} mb-4" style="${color}">${text}</div>`;
           break;
         }
         case 'html':
@@ -3018,12 +3199,12 @@ app.get('/p/:slug', (req, res) => {
           contentHtml += `
             <div class="flex flex-col items-center my-6">
               <figure class="max-w-full text-center">
-                <img src="${url}" alt="${alt}" title="${title || alt}" class="max-w-full rounded-2xl border border-slate-100 shadow-sm object-cover max-h-[480px] mx-auto cursor-zoom-in hover:brightness-95 transition" onclick="openLightbox('${url}', '${escapedAlt}', '${escapedTitle}', '${escapedDesc}')" referrerPolicy="no-referrer" />
+                <img src="${url}" alt="${alt}" title="${title || alt}" class="max-w-full rounded-2xl border ${isDark ? 'border-slate-800' : 'border-slate-100'} shadow-sm object-cover max-h-[480px] mx-auto cursor-zoom-in hover:brightness-95 transition" onclick="openLightbox('${url}', '${escapedAlt}', '${escapedTitle}', '${escapedDesc}')" referrerPolicy="no-referrer" />
                 ${(title || alt || desc) ? `
                   <figcaption class="mt-3 text-slate-500 max-w-xl mx-auto">
-                    ${title ? `<div class="text-sm font-bold text-slate-800">${title}</div>` : ''}
-                    ${alt && alt !== title ? `<div class="text-xs text-slate-400 italic">${alt}</div>` : ''}
-                    ${desc ? `<div class="text-xs text-slate-500 mt-1">${desc}</div>` : ''}
+                    ${title ? `<div class="${captionTitleClass}">${title}</div>` : ''}
+                    ${alt && alt !== title ? `<div class="${captionAltClass}">${alt}</div>` : ''}
+                    ${desc ? `<div class="${captionDescClass}">${desc}</div>` : ''}
                   </figcaption>
                 ` : ''}
               </figure>
@@ -3038,17 +3219,17 @@ app.get('/p/:slug', (req, res) => {
             const ytId = getYoutubeId(embedUrl);
             if (ytId) {
               contentHtml += `
-                <div class="aspect-video w-full max-w-3xl mx-auto rounded-2xl overflow-hidden shadow-md my-6 border border-slate-100 bg-black">
+                <div class="aspect-video w-full max-w-3xl mx-auto rounded-2xl overflow-hidden shadow-md my-6 border ${isDark ? 'border-slate-800' : 'border-slate-100'} bg-black">
                   <iframe src="https://www.youtube.com/embed/${ytId}" class="w-full h-full" allowfullscreen frameborder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture"></iframe>
                 </div>
               `;
             } else {
-              contentHtml += `<div class="bg-slate-100 text-slate-500 text-xs p-4 rounded-xl text-center italic my-4">Invalid YouTube URL: ${embedUrl}</div>`;
+              contentHtml += `<div class="${emptyBlockClass}">Invalid YouTube URL: ${embedUrl}</div>`;
             }
           } else if (type === 'twitter' && embedUrl) {
             contentHtml += `
               <div class="flex justify-center my-6">
-                <blockquote class="twitter-tweet" data-theme="light" data-align="center" style="max-width: 550px; width: 100%;">
+                <blockquote class="twitter-tweet" data-theme="${isDark ? 'dark' : 'light'}" data-align="center" style="max-width: 550px; width: 100%;">
                   <a href="${embedUrl}">Loading X Post...</a>
                 </blockquote>
                 <script async src="https://platform.twitter.com/widgets.js" charset="utf-8"></script>
@@ -3058,17 +3239,17 @@ app.get('/p/:slug', (req, res) => {
             const cleanUrl = embedUrl.endsWith('/') ? embedUrl : embedUrl + '/';
             contentHtml += `
               <div class="flex justify-center my-6">
-                <iframe src="${cleanUrl}embed" class="w-full max-w-md h-[480px] border border-slate-100 rounded-2xl shadow-sm" frameborder="0" scrolling="no" allowtransparency="true"></iframe>
+                <iframe src="${cleanUrl}embed" class="w-full max-w-md h-[480px] border ${isDark ? 'border-slate-800' : 'border-slate-100'} rounded-2xl shadow-sm" frameborder="0" scrolling="no" allowtransparency="true"></iframe>
               </div>
             `;
           } else if (embedUrl) {
             contentHtml += `
-              <div class="aspect-video w-full max-w-3xl mx-auto rounded-2xl overflow-hidden shadow-md my-6 border border-slate-100 bg-slate-50">
+              <div class="aspect-video w-full max-w-3xl mx-auto rounded-2xl overflow-hidden shadow-md my-6 border ${isDark ? 'border-slate-800/80' : 'border-slate-100'} ${embedBgClass}">
                 <iframe src="${embedUrl}" class="w-full h-full" frameborder="0"></iframe>
               </div>
             `;
           } else {
-            contentHtml += `<div class="bg-slate-100 text-slate-400 text-xs p-4 rounded-xl text-center italic my-4">Empty Social Embed Block</div>`;
+            contentHtml += `<div class="${emptyBlockClass}">Empty Social Embed Block</div>`;
           }
           break;
         }
@@ -3077,12 +3258,12 @@ app.get('/p/:slug', (req, res) => {
           const pdfTitle = block.settings.pdfTitle || 'Attached PDF Document';
           if (pdfUrl) {
             contentHtml += `
-              <div class="max-w-xl mx-auto bg-slate-50 hover:bg-slate-100/80 border border-slate-200/60 rounded-2xl p-5 my-6 flex items-center justify-between transition group shadow-sm">
+              <div class="${pdfBlockClass}">
                 <div class="flex items-center space-x-4">
                   <div class="h-12 w-12 bg-rose-50 text-rose-600 rounded-xl flex items-center justify-center font-bold text-xs shadow-sm group-hover:bg-rose-100 transition">PDF</div>
                   <div>
-                    <h4 class="text-sm font-bold text-slate-800">${pdfTitle}</h4>
-                    <p class="text-xs text-slate-400 mt-0.5">Click to view or download PDF report</p>
+                    <h4 class="${pdfTitleClass}">${pdfTitle}</h4>
+                    <p class="${pdfDescClass}">Click to view or download PDF report</p>
                   </div>
                 </div>
                 <a href="${pdfUrl}" target="_blank" class="px-4 py-2 bg-slate-800 hover:bg-slate-900 text-white rounded-xl text-xs font-bold transition shadow-sm">
@@ -3091,7 +3272,7 @@ app.get('/p/:slug', (req, res) => {
               </div>
             `;
           } else {
-            contentHtml += `<div class="bg-slate-100 text-slate-400 text-xs p-4 rounded-xl text-center italic my-4">Empty PDF Block</div>`;
+            contentHtml += `<div class="${emptyBlockClass}">Empty PDF Block</div>`;
           }
           break;
         }
@@ -3108,14 +3289,14 @@ app.get('/p/:slug', (req, res) => {
         case 'quote': {
           const text = block.settings.text || '';
           contentHtml += `
-            <blockquote class="border-l-4 border-teal-500 bg-slate-50 p-6 rounded-r-2xl my-6 italic text-lg text-slate-700" style="${color ? `border-color: ${block.settings.color};` : ''}">
+            <blockquote class="${quoteClass}" style="${color ? `border-color: ${block.settings.color};` : ''}">
               "${text}"
             </blockquote>
           `;
           break;
         }
         case 'divider': {
-          contentHtml += `<hr class="border-t border-slate-200 my-8" />`;
+          contentHtml += `<hr class="${dividerClass}" />`;
           break;
         }
         case 'form': {
@@ -3129,30 +3310,30 @@ app.get('/p/:slug', (req, res) => {
               if (f.type === 'textarea') {
                 fieldsHtml += `
                   <div class="mb-4">
-                    <label class="block text-sm font-medium text-slate-700 mb-1" for="${f.id}">${f.label}${f.required ? ' <span class="text-rose-500">*</span>' : ''}</label>
-                    <textarea name="${f.id}" id="${f.id}" rows="4" placeholder="${f.placeholder || ''}" ${reqAttr} class="w-full px-4 py-2 bg-white border border-slate-200 rounded-xl text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:border-transparent text-sm transition"></textarea>
+                    <label class="${formLabelClass}" for="${f.id}">${f.label}${f.required ? ' <span class="text-rose-500">*</span>' : ''}</label>
+                    <textarea name="${f.id}" id="${f.id}" rows="4" placeholder="${f.placeholder || ''}" ${reqAttr} class="${formInputClass}"></textarea>
                   </div>
                 `;
               } else if (f.type === 'checkbox') {
                 fieldsHtml += `
                   <div class="flex items-center mb-4">
                     <input type="checkbox" name="${f.id}" id="${f.id}" ${reqAttr} class="h-4 w-4 rounded border-slate-300 text-teal-600 focus:ring-teal-500">
-                    <label class="ml-2 block text-sm text-slate-700" for="${f.id}">${f.label}${f.required ? ' <span class="text-rose-500">*</span>' : ''}</label>
+                    <label class="ml-2 block text-sm ${isDark ? 'text-slate-300' : 'text-slate-700'}" for="${f.id}">${f.label}${f.required ? ' <span class="text-rose-500">*</span>' : ''}</label>
                   </div>
                 `;
               } else {
                 fieldsHtml += `
                   <div class="mb-4">
-                    <label class="block text-sm font-medium text-slate-700 mb-1" for="${f.id}">${f.label}${f.required ? ' <span class="text-rose-500">*</span>' : ''}</label>
-                    <input type="${f.type}" name="${f.id}" id="${f.id}" placeholder="${f.placeholder || ''}" ${reqAttr} class="w-full px-4 py-2 bg-white border border-slate-200 rounded-xl text-slate-800 placeholder-slate-400 focus:outline-none focus:ring-2 focus:ring-teal-500 focus:border-transparent text-sm transition" />
+                    <label class="${formLabelClass}" for="${f.id}">${f.label}${f.required ? ' <span class="text-rose-500">*</span>' : ''}</label>
+                    <input type="${f.type}" name="${f.id}" id="${f.id}" placeholder="${f.placeholder || ''}" ${reqAttr} class="${formInputClass}" />
                   </div>
                 `;
               }
             });
             
             contentHtml += `
-              <div class="bg-slate-50 border border-slate-100 p-6 md:p-8 rounded-2xl my-8 max-w-xl mx-auto shadow-sm">
-                <h3 class="text-lg font-bold text-slate-800 mb-4">${targetForm.name}</h3>
+              <div class="${formWrapperClass}">
+                <h3 class="${formTitleClass}">${targetForm.name}</h3>
                 <form id="dynamic-form-${targetForm.id}" onsubmit="submitCmsForm(event, '${targetForm.id}')" class="space-y-4">
                   ${fieldsHtml}
                   <div id="form-error-${targetForm.id}" class="hidden text-rose-600 bg-rose-50 text-xs px-3 py-2 rounded-lg border border-rose-100"></div>
@@ -3266,7 +3447,6 @@ app.get('/p/:slug', (req, res) => {
   const captchaMode = settings.captchaMode || 'built_in_math';
   const captchaProvider = settings.captchaProvider || 'google_recaptcha';
 
-  const websiteType = db.siteSettings?.websiteType || 'blog';
   const isPortfolio = websiteType === 'portfolio';
   const siteName = db.siteSettings?.siteName || 'GoPixel CMS';
 
@@ -3601,7 +3781,7 @@ app.get('/p/:slug', (req, res) => {
           <!-- Tags Render -->
           ${post.tags && post.tags.length > 0 ? `
             <div class="flex flex-wrap gap-2 mt-4">
-              ${post.tags.map(t => `<span class="bg-slate-100 text-slate-600 hover:bg-slate-200 px-2.5 py-1 rounded-full text-xs font-bold transition">#${t}</span>`).join('')}
+              ${post.tags.map(t => `<span class="${tagClass}">#${t}</span>`).join('')}
             </div>
           ` : ''}
 

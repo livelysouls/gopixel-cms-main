@@ -1,131 +1,20 @@
 <div align="center">
-
-<img src="https://gopixel.in/images/logo-CMS.png" width="140">
-
-# GoPixel CMS
-
-### Build Visually. Compile Instantly. Rank Faster.
-
-A modern Open Source Visual CMS that compiles pages into semantic static HTML for incredible performance, SEO and Core Web Vitals.
-
-[![GPL-3.0 License](https://img.shields.io/badge/License-GPL--3.0-orange.svg)](LICENSE)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.x-blue.svg)]()
-[![Node.js](https://img.shields.io/badge/Node.js-22.x-green.svg)]()
-
+<img width="1200" height="475" alt="GHBanner" src="https://ai.google.dev/static/site-assets/images/share-ais-513315318.png" />
 </div>
 
----
+# Run and deploy your AI Studio app
 
-## Why GoPixel CMS?
+This contains everything you need to run your app locally.
 
-Unlike traditional CMS platforms that generate pages dynamically on every request, GoPixel CMS compiles visual layouts into clean semantic HTML before publishing.
+View your app in AI Studio: https://ai.studio/apps/ef1e0392-2d46-4f26-8ecb-033e252c68ed
 
-This provides:
+## Run Locally
 
-- ⚡ Extremely fast page loading
-- 📈 Better SEO
-- 🚀 Improved Core Web Vitals
-- 🏆 Crawl-friendly HTML
-- 🎨 Visual drag-and-drop editing
-- 🔒 Built-in security
-- 🌍 Open Source
+**Prerequisites:**  Node.js
 
----
 
-# Features
-
-- Visual Page Builder
-- SSR HTML Compiler
-- Dynamic Schema Generator
-- Forms Builder
-- Media Manager
-- Redirect Manager
-- SEO Tools
-- Audit Logs
-- User Roles
-- Categories
-- Comments
-- Theme Customizer
-- Responsive Output
-- REST API
-
----
-
-# Demo
-For Demo: [https://demo-cms.gopixel.in/](https://demo-cms.gopixel.in/)
-
----
-
-# Screenshots
-
-| Dashboard | Visual Builder |
-|------------|----------------|
-| *(coming soon)* | *(coming soon)* |
-
----
-
-# Installation
-
-```bash
-git clone https://github.com/livelysouls/gopixel-cms.git
-
-cd gopixel-cms
-
-npm install
-
-npm run build
-
-npm start
-```
-
----
-
-# Tech Stack
-
-- TypeScript
-- Node.js
-- Express
-- MySQL
-- EJS
-- CSS
-- SSR Compiler
-
----
-
-# Roadmap
-
-- Plugin Marketplace
-- Theme Marketplace
-- CLI
-- Docker
-- Auto Updater
-- AI Assistant
-- Multi-language
-- PWA
-- Headless Mode
-
----
-
-# Contributing
-
-Contributions are welcome.
-
-Fork the repository and submit a Pull Request.
-
----
-
-# License
-
-GPL-3.0
-
-See LICENSE for details.
-
----
-
-<div align="center">
-
-Made with ❤️ by GoPixel Studios
-
-https://cms.gopixel.in
-
-</div>
+1. Install dependencies:
+   `npm install`
+2. Set the `GEMINI_API_KEY` in [.env.local](.env.local) to your Gemini API key
+3. Run the app:
+   `npm run dev`
